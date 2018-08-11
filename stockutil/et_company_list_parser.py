@@ -11,8 +11,10 @@ from bs4 import BeautifulSoup
 
 ET_SERVER_URL = 'https://economictimes.indiatimes.com'
 COMPANIES_LISTING_PATH = 'markets/stocks/stock-quotes'
-QUARTERLY_RESULT_URL = 'https://etfeedscache.indiatimes.com/ETServiceChartCompanyPage/GetCompanyQuaterData?charttype=&companyid={}&columnname={}&sortorder=ASC&callback=&nuofquarter=20&currencyformat=2&resulttype=nonconsolidate'
 BASE_URL = f'{ET_SERVER_URL}/{COMPANIES_LISTING_PATH}'
+
+QUARTERLY_RESULT_URL = 'https://etfeedscache.indiatimes.com/ETServiceChartCompanyPage/GetCompanyQuaterData?charttype=&companyid={}&columnname={}&sortorder=ASC&callback=&nuofquarter=20&currencyformat=2&resulttype=nonconsolidate'
+LIVE_FEED_URL = 'https://json.bselivefeeds.indiatimes.com/ET_Community/companypagedata?companyid={}'
 
 
 def get_a_to_z_chr_list():

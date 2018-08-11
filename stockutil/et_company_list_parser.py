@@ -159,12 +159,26 @@ class QuarterlyResult(NamedTuple):
         return cls.create(data['value'], data['result_date'])
 
 
+class BetaDuration(Enum):
+
+    THREE_YEAR = ('3y', 'threeYearBeta')
+    ONE_YEAR = ('1y', 'oneYearBeta')
+    SIX_MONTH = ('6m', 'sixMonthBeta')
+    THREE_MONTH = ('3m', 'threeMonthBeta')
+    ONE_MONTH = ('1m', 'oneMonthBeta')
+
+    def __init__(self, p_name, r_name):
+        self.p_name = p_name
+        self.r_name = r_name
+
+
 class PageData:
 
     def __init__(self, company_name: str, et_id: str, mkt_cap_in_cr: Optional[float], pe_ratio: Optional[float],
                  pb_ratio: Optional[float], div_yield: Optional[float], face_value: Optional[float],
                  earning_per_share: Optional[float], book_value: Optional[float], low_52_week: Optional[float],
-                 high_52_week: Optional[float], quarterly_results: Dict[FinancialResultFeature, List[QuarterlyResult]],
+                 high_52_week: Optional[float], sector: str, industry: str, symbol: str, instrument: str,
+                 beta: Dict[str, float], quarterly_results: Dict[FinancialResultFeature, List[QuarterlyResult]],
                  share_holding_pattern: List[ShareHoldingPattern], mutual_fund_holding: List[MFHolding]):
 
         self.company_name: str = company_name
@@ -178,6 +192,11 @@ class PageData:
         self.book_value = book_value
         self.low_52_week = low_52_week
         self.high_52_week = high_52_week
+        self.sector = sector
+        self.industry = industry
+        self.symbol = symbol
+        self.instrument = instrument
+        self.beta = beta
         self.quarterly_results = quarterly_results
         self.share_holding_pattern = share_holding_pattern
         self.mutual_fund_holding = mutual_fund_holding
@@ -186,6 +205,10 @@ class PageData:
         data = {
             'company_name': self.company_name,
             'et_id': self.et_id,
+            'symbol': self.symbol,
+            'sector': self.sector,
+            'industry': self.industry,
+            'instrument': self.instrument,
             'mkt_cap_in_cr': self.mkt_cap_in_cr,
             'pe_ratio': self.pe_ratio,
             'pb_ratio': self.pb_ratio,
@@ -195,6 +218,7 @@ class PageData:
             'book_value': self.book_value,
             'low_52_week': self.low_52_week,
             'high_52_week': self.high_52_week,
+            'beta': self.beta,
             'quarterly_results': {k.name: list(map(lambda x: x.to_json(), v)) for k,v in self.quarterly_results.items()},
             'share_holding_pattern': list(map(lambda x: x.to_json(), self.share_holding_pattern)),
             'mutual_fund_holding': list(map(lambda x: x.to_json(), self.mutual_fund_holding))
@@ -216,6 +240,11 @@ class PageData:
             book_value=data['book_value'],
             low_52_week=data['low_52_week'],
             high_52_week=data['high_52_week'],
+            sector=data['sector'],
+            industry=data['industry'],
+            symbol=data['symbol'],
+            instrument=data['instrument'],
+            beta=data['beta'],
             quarterly_results={FinancialResultFeature[k]: list(map(lambda x: QuarterlyResult.from_json(x), v)) for k,v in data['quarterly_results'].items()},
             share_holding_pattern=list(map(lambda x: ShareHoldingPattern.from_json(x), data['share_holding_pattern'])),
             mutual_fund_holding=list(map(lambda x: MFHolding.from_json(x), data['mutual_fund_holding']))
@@ -287,8 +316,8 @@ def parse_page(company: CompanyNameAndUrl):
     quarterly_results_data = {}
     share_holding_data = []
     mf_listing_data = []
-    page_data = PageData(company.name, company.et_id, None, None, None, None, None, None, None, None, None,
-                         quarterly_results_data, share_holding_data, mf_listing_data)
+    page_data = PageData(company.name, company.et_id, None, None, None, None, None, None, None, None, None, None, None,
+                         None, None, None, quarterly_results_data, share_holding_data, mf_listing_data)
     resp = fetch_from_url(company.et_url)
     if resp.status_code != HTTPStatus.OK:
         print(f'Could not access page for company {company.name}')
@@ -421,6 +450,21 @@ def parse_page(company: CompanyNameAndUrl):
 
     # page_dict['mutual_fund_holding'] = list(map(lambda x: x.to_json(), mf_listing_data))
     page_data.mutual_fund_holding = mf_listing_data
+
+    # parse info from live feed
+    resp = fetch_from_url(LIVE_FEED_URL.format(company.et_id))
+    if resp.status_code == HTTPStatus.OK:
+        data = resp.json()
+        segment_data = data['bseNseJson'][-1]
+        company_beta = data['companyBeta'][-1]
+
+        page_data.sector = segment_data.get('sector')
+        page_data.industry = segment_data.get('industry')
+        page_data.symbol = segment_data.get('symbol')
+        page_data.instrument = segment_data.get('instrument')
+
+        page_data.beta = {bd.p_name: company_beta.get(bd.r_name) for bd in list(BetaDuration)}
+
     return page_data
 
 
@@ -440,6 +484,7 @@ if __name__ == '__main__':
     pd_json = page_data.to_json()
     pd_from_json = PageData.from_json(pd_json)
 
-    print(pd_from_json.quarterly_results[FinancialResultFeature.Sales])
-    print(pd_from_json.quarterly_results[FinancialResultFeature.OperatingProfit])
-    print(pd_from_json.quarterly_results[FinancialResultFeature.Eps])
+    # print(pd_from_json.quarterly_results[FinancialResultFeature.Sales])
+    # print(pd_from_json.quarterly_results[FinancialResultFeature.OperatingProfit])
+    # print(pd_from_json.quarterly_results[FinancialResultFeature.Eps])
+    print(pd_from_json.beta)

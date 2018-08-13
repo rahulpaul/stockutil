@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import sqlite3
 import requests
 import datetime
 from enum import Enum
@@ -443,7 +444,10 @@ def parse_page(company: CompanyNameAndUrl):
         no_of_shares = int(divs[2].text.replace(',', ''))
         change_percent = extract_percent(divs[3].span.text)
         percent_of_aum = extract_percent(divs[4].text)
-        invested_amount = float(divs[5].text)
+        try:
+            invested_amount = float(divs[5].text)
+        except ValueError:
+            invested_amount = None
         data = MFHolding(fund_name, category, no_of_shares, change_percent, percent_of_aum, invested_amount)
         mf_listing_data.append(data)
         # print(data)
@@ -455,36 +459,168 @@ def parse_page(company: CompanyNameAndUrl):
     resp = fetch_from_url(LIVE_FEED_URL.format(company.et_id))
     if resp.status_code == HTTPStatus.OK:
         data = resp.json()
-        segment_data = data['bseNseJson'][-1]
-        company_beta = data['companyBeta'][-1]
+        segment_data = data['bseNseJson'][-1] if data.get('bseNseJson') else None
+        company_beta = data['companyBeta'][-1] if data.get('companyBeta') else None
 
-        page_data.sector = segment_data.get('sector')
-        page_data.industry = segment_data.get('industry')
-        page_data.symbol = segment_data.get('symbol')
-        page_data.instrument = segment_data.get('instrument')
+        if segment_data:
+            page_data.sector = segment_data.get('sector')
+            page_data.industry = segment_data.get('industry')
+            page_data.symbol = segment_data.get('symbol')
+            page_data.instrument = segment_data.get('instrument')
 
-        page_data.beta = {bd.p_name: company_beta.get(bd.r_name) for bd in list(BetaDuration)}
+        if company_beta:
+            page_data.beta = {bd.p_name: company_beta.get(bd.r_name) for bd in list(BetaDuration)}
 
     return page_data
 
 
-def main(root_data_directory: str):
-    directory = os.path.join(root_data_directory, 'listing')
+class DataPersistenceService:
+
+    et_companies = 'ET_COMPANY'
+    et_companies_data = 'ET_COMPANY_DATA'
+
+    et_company_create_cmd = f""" CREATE TABLE IF NOT EXISTS {et_companies} (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        et_company_page_url TEXT,
+        et_splits_page_url TEXT,
+        et_dividends_page_url TEXT,
+        et_bonus_page_url TEXT
+    );        
+    """
+
+    et_company_data_create_cmd = f""" CREATE TABLE IF NOT EXISTS {et_companies_data} (
+        id TEXT PRIMARY KEY,
+        symbol TEXT,
+        name TEXT,
+        sector TEXT,
+        industry TEXT,
+        market_cap REAL,
+        data TEXT        
+    );
+    """
+
+    insert_into_et_company_sql = f"INSERT INTO {et_companies} VALUES (?, ?, ?, ?, ?, ?)"
+    insert_into_et_company_data_sql = f"INSERT INTO {et_companies_data} VALUES (?, ?, ?, ?, ?, ?, ?)"
+
+    select_from_et_company_sql = f"SELECT id, name, et_company_page_url FROM {et_companies} ORDER BY name LIMIT {{}} OFFSET {{}}"
+    select_from_et_company_data_sql = f"SELECT data from {et_companies_data} WHERE id = '{{}}'"
+
+    def __init__(self):
+        self.conn = None
+
+    def __enter__(self):
+        self.conn = sqlite3.connect("etStocks.db")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            self.conn.close()
+
+    def create_tables(self):
+        cursor = self.conn.cursor()
+        cursor.execute(self.et_company_create_cmd)
+        cursor.execute(self.et_company_data_create_cmd)
+        self.conn.commit()
+
+    def save_et_company(self, entry: CompanyNameAndUrl):
+        data = (entry.et_id, entry.name, entry.et_url, entry.et_splits_page_url,
+                entry.et_dividends_page_url, entry.et_bonus_page_url)
+        cursor = self.conn.cursor()
+        cursor.execute(self.insert_into_et_company_sql, data)
+        self.conn.commit()
+
+    def save_et_company_entries(self, entry_list: List[CompanyNameAndUrl]):
+        data = [(entry.et_id, entry.name, entry.et_url, entry.et_splits_page_url, entry.et_dividends_page_url,
+                 entry.et_bonus_page_url) for entry in entry_list]
+
+        try:
+            self.conn.executemany(self.insert_into_et_company_sql, data)
+            self.conn.commit()
+        except sqlite3.DatabaseError as e:
+            self.conn.rollback()
+            raise e
+
+    def save_et_company_data_entries(self, entry_list: List[PageData]):
+        data_list = []
+        for entry in entry_list:
+            json_str = json.dumps(entry.to_json())
+            data = entry.et_id, entry.symbol, entry.company_name, entry.sector, entry.industry, entry.mkt_cap_in_cr, json_str
+            data_list.append(data)
+
+        self.conn.executemany(self.insert_into_et_company_data_sql, data_list)
+        self.conn.commit()
+
+    def fetch_et_companies(self, limit, offset) -> List[CompanyNameAndUrl]:
+        cursor = self.conn.cursor()
+        cursor.execute(self.select_from_et_company_sql.format(limit, offset))
+        return list(map(lambda x: CompanyNameAndUrl(name=x[1], et_url=x[2], et_id=x[0]), cursor.fetchall()))
+
+    def fetch_et_company_data(self, company: CompanyNameAndUrl) -> PageData:
+        cursor = self.conn.cursor()
+        cursor.execute(self.select_from_et_company_data_sql.format(company.et_id))
+        data = cursor.fetchone()
+        if data:
+            return PageData.from_json(json.loads(data[0]))
+
+
+def populate_et_company(persistence_service: DataPersistenceService):
     for ticker in ticker_values:
-        write_company_lookup_info_to_csv(directory, ticker, get_listing(ticker))
-        print(ticker, end='')
+        company_listing = get_listing(ticker)
+        try:
+            persistence_service.save_et_company_entries(company_listing)
+        except sqlite3.DatabaseError:
+            # let us try to insert one entry at a time
+            for company in company_listing:
+                try:
+                    persistence_service.save_et_company(company)
+                except sqlite3.DatabaseError as e:
+                    print(e, company)
     print('\nCompleted')
 
 
-if __name__ == '__main__':
-    # root_dir = sys.argv[1]
-    # print(f'root_dir = {root_dir}')
-    # main(root_dir)
-    page_data = parse_page(CompanyNameAndUrl('Gujarat Alkalies', 'https://economictimes.indiatimes.com/gujarat-alkalies-chemicals-ltd/stocks/companyid-13690.cms', '13690'))
-    pd_json = page_data.to_json()
-    pd_from_json = PageData.from_json(pd_json)
+def populate_et_company_data(persistence_service: DataPersistenceService):
 
-    # print(pd_from_json.quarterly_results[FinancialResultFeature.Sales])
-    # print(pd_from_json.quarterly_results[FinancialResultFeature.OperatingProfit])
-    # print(pd_from_json.quarterly_results[FinancialResultFeature.Eps])
-    print(pd_from_json.beta)
+    def _parse_page_with_retry(c: CompanyNameAndUrl, max_retries, retry=0) -> PageData:
+        import time
+        try:
+            return parse_page(c)
+        except requests.ConnectionError as e:
+            if retry > max_retries:
+                raise e
+            time.sleep(5)
+            return _parse_page_with_retry(c, max_retries, retry+1)
+
+    batch_size = 10
+    offset = 0
+    while True:
+        company_list = persistence_service.fetch_et_companies(limit=batch_size, offset=offset)
+        offset += batch_size
+        data_list = []
+        for company in company_list:
+            page_data = persistence_service.fetch_et_company_data(company)
+            if not page_data:
+                try:
+                    data_list.append(_parse_page_with_retry(company, 20))
+                except requests.exceptions.ConnectionError as e:
+                    raise e
+
+        if data_list:
+            persistence_service.save_et_company_data_entries(data_list)
+
+        print(f"Parsing completed for {[company.name for company in company_list]}")
+        print(f"offset = {offset}")
+        if len(company_list) < batch_size:
+            print("\nCompleted")
+            break
+
+
+def main():
+    with DataPersistenceService() as persistence_service:
+        persistence_service.create_tables()
+        # populate_et_company(persistence_service)
+        populate_et_company_data(persistence_service)
+
+
+if __name__ == '__main__':
+    main()

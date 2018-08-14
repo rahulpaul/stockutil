@@ -4,7 +4,9 @@ import json
 import sqlite3
 import requests
 import datetime
+import pandas as pd
 from enum import Enum
+from collections import defaultdict
 from http import HTTPStatus
 from typing import List, Dict, Optional, NamedTuple
 from bs4 import BeautifulSoup
@@ -251,6 +253,13 @@ class PageData:
             mutual_fund_holding=list(map(lambda x: MFHolding.from_json(x), data['mutual_fund_holding']))
         )
 
+    def create_quarterly_results_df(self) -> pd.DataFrame:
+        result_date_to_value_dict: Dict[str, Dict[str, float]] = defaultdict(dict)
+        for feature, result_list in self.to_json()['quarterly_results'].items():
+            for result in result_list:
+                result_date_to_value_dict[feature][result['result_date']] = result['value']
+        return pd.DataFrame(result_date_to_value_dict)
+
 
 def extract_company_id_from_url(company_url):
     company_id_prefix = 'companyid-'
@@ -313,7 +322,7 @@ def get_float_value(data_dict: Dict[str, str], key: str) -> Optional[float]:
         return float(str_value)
 
 
-def parse_page(company: CompanyNameAndUrl):
+def parse_page(company: CompanyNameAndUrl) -> Optional[PageData]:
     quarterly_results_data = {}
     share_holding_data = []
     mf_listing_data = []
@@ -503,7 +512,9 @@ class DataPersistenceService:
     insert_into_et_company_sql = f"INSERT INTO {et_companies} VALUES (?, ?, ?, ?, ?, ?)"
     insert_into_et_company_data_sql = f"INSERT INTO {et_companies_data} VALUES (?, ?, ?, ?, ?, ?, ?)"
 
+    select_from_et_company_by_name = f"SELECT id, name, et_company_page_url FROM {et_companies} WHERE name LIKE '%{{}}%'"
     select_from_et_company_sql = f"SELECT id, name, et_company_page_url FROM {et_companies} ORDER BY name LIMIT {{}} OFFSET {{}}"
+    select_from_et_company_data_by_name = f"SELECT data from {et_companies_data} WHERE name LIKE '%{{}}%'"
     select_from_et_company_data_sql = f"SELECT data from {et_companies_data} WHERE id = '{{}}'"
 
     def __init__(self):
@@ -551,6 +562,20 @@ class DataPersistenceService:
         self.conn.executemany(self.insert_into_et_company_data_sql, data_list)
         self.conn.commit()
 
+    def fetch_et_company_by_name(self, name) -> Optional[CompanyNameAndUrl]:
+        cursor = self.conn.cursor()
+        cursor.execute(self.select_from_et_company_by_name.format(name))
+        data = cursor.fetchone()
+        if data:
+            return CompanyNameAndUrl(name=data[1], et_url=data[2], et_id=data[0])
+
+    def fetch_et_company_data_by_name(self, name) -> Optional[PageData]:
+        cursor = self.conn.cursor()
+        cursor.execute(self.select_from_et_company_data_by_name.format(name))
+        data = cursor.fetchone()
+        if data:
+            return PageData.from_json(json.loads(data[0]))
+
     def fetch_et_companies(self, limit, offset) -> List[CompanyNameAndUrl]:
         cursor = self.conn.cursor()
         cursor.execute(self.select_from_et_company_sql.format(limit, offset))
@@ -562,6 +587,11 @@ class DataPersistenceService:
         data = cursor.fetchone()
         if data:
             return PageData.from_json(json.loads(data[0]))
+
+    def execute(self, sql):
+        cursor = self.conn.cursor()
+        cursor.execute(sql)
+        return cursor.fetchall()
 
 
 def populate_et_company(persistence_service: DataPersistenceService):
@@ -613,6 +643,17 @@ def populate_et_company_data(persistence_service: DataPersistenceService):
         if len(company_list) < batch_size:
             print("\nCompleted")
             break
+
+
+def get_industries_group_by_sector() -> Dict[str, List[str]]:
+    result = defaultdict(set)
+    sql = f"SELECT sector, industry FROM {DataPersistenceService.et_companies_data} ORDER BY sector"
+    with DataPersistenceService() as service:
+        data = service.execute(sql)
+        for sector, industry in data:
+            if (sector is not None) and (industry is not None):
+                result[sector].add(industry)
+        return result
 
 
 def main():

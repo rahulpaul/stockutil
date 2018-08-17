@@ -4,7 +4,9 @@ import json
 import sqlite3
 import requests
 import datetime
+import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from enum import Enum
 from collections import defaultdict
 from http import HTTPStatus
@@ -42,19 +44,20 @@ def fetch_from_url(url: str) -> requests.Response:
 
 class FinancialResultFeature(Enum):
 
-    Sales = ('salesTurnOver',)
-    OtherIncome = ('otherIncomeValue',)
-    OperatingProfit = ('operatingProfitValue',)
-    OtherOperatingIncome = ('otherOperatingIncomeValue',)
-    Ebita = ('ebitDAValue',)
-    Interest = ('interestValue',)
-    Depreciation = ('depreciationValue',)
-    Tax = ('taxValue',)
-    NetProfit = ('netProfitValue',)
-    Eps = ('afterDilutedEPSValue',)
+    Sales = ('salesTurnOver', True)
+    OtherIncome = ('otherIncomeValue', True)
+    OperatingProfit = ('operatingProfitValue', True)
+    OtherOperatingIncome = ('otherOperatingIncomeValue', True)
+    Ebita = ('ebitDAValue', True)
+    Interest = ('interestValue', False)
+    Depreciation = ('depreciationValue', False)
+    Tax = ('taxValue', True)
+    NetProfit = ('netProfitValue', True)
+    Eps = ('afterDilutedEPSValue', True)
 
-    def __init__(self, column_name):
+    def __init__(self, column_name, higher_is_better):
         self.column_name = column_name
+        self.higher_is_better = higher_is_better
 
 
 class CompanyNameAndUrl(NamedTuple):
@@ -204,6 +207,9 @@ class PageData:
         self.share_holding_pattern = share_holding_pattern
         self.mutual_fund_holding = mutual_fund_holding
 
+        # derived features
+        self._quarterly_results_df: Optional[pd.DataFrame] = None
+
     def to_json(self):
         data = {
             'company_name': self.company_name,
@@ -253,12 +259,24 @@ class PageData:
             mutual_fund_holding=list(map(lambda x: MFHolding.from_json(x), data['mutual_fund_holding']))
         )
 
-    def create_quarterly_results_df(self) -> pd.DataFrame:
+    @property
+    def quarterly_results_df(self) -> pd.DataFrame:
+        if self._quarterly_results_df is not None:
+            return self._quarterly_results_df
         result_date_to_value_dict: Dict[str, Dict[str, float]] = defaultdict(dict)
         for feature, result_list in self.to_json()['quarterly_results'].items():
             for result in result_list:
                 result_date_to_value_dict[feature][result['result_date']] = result['value']
-        return pd.DataFrame(result_date_to_value_dict)
+        self._quarterly_results_df = pd.DataFrame(result_date_to_value_dict)
+        return self._quarterly_results_df
+
+
+class LinearFit(NamedTuple):
+    x: np.ndarray
+    y: np.ndarray
+    predicted_y: np.ndarray
+    m: float
+    c: float
 
 
 def extract_company_id_from_url(company_url):
@@ -488,6 +506,8 @@ class DataPersistenceService:
     et_companies = 'ET_COMPANY'
     et_companies_data = 'ET_COMPANY_DATA'
 
+    linear_fit = 'LINEAR_FIT'
+
     et_company_create_cmd = f""" CREATE TABLE IF NOT EXISTS {et_companies} (
         id TEXT PRIMARY KEY,
         name TEXT,
@@ -509,8 +529,23 @@ class DataPersistenceService:
     );
     """
 
+    linear_fit_create_cmd = f""" CREATE TABLE IF NOT EXISTS {linear_fit} (
+        et_id TEXT,
+        symbol TEXT,
+        name TEXT,
+        sector TEXT,
+        industry TEXT,
+        market_cap REAL,
+        feature TEXT,
+        m REAL,
+        c REAL,
+        mc_ratio REAL
+    )
+    """
+
     insert_into_et_company_sql = f"INSERT INTO {et_companies} VALUES (?, ?, ?, ?, ?, ?)"
     insert_into_et_company_data_sql = f"INSERT INTO {et_companies_data} VALUES (?, ?, ?, ?, ?, ?, ?)"
+    insert_into_linear_fit_sql = f"INSERT INTO {linear_fit} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 
     select_from_et_company_by_name = f"SELECT id, name, et_company_page_url FROM {et_companies} WHERE name LIKE '%{{}}%'"
     select_from_et_company_sql = f"SELECT id, name, et_company_page_url FROM {et_companies} ORDER BY name LIMIT {{}} OFFSET {{}}"
@@ -532,6 +567,7 @@ class DataPersistenceService:
         cursor = self.conn.cursor()
         cursor.execute(self.et_company_create_cmd)
         cursor.execute(self.et_company_data_create_cmd)
+        cursor.execute(self.linear_fit_create_cmd)
         self.conn.commit()
 
     def save_et_company(self, entry: CompanyNameAndUrl):
@@ -560,6 +596,18 @@ class DataPersistenceService:
             data_list.append(data)
 
         self.conn.executemany(self.insert_into_et_company_data_sql, data_list)
+        self.conn.commit()
+
+    def save_linear_fit(self, company_data: PageData, feature_to_linear_fit: Dict[FinancialResultFeature, LinearFit]):
+        data_list = []
+        for feature, fit in feature_to_linear_fit.items():
+            mc_ratio = fit.m / fit.c if (fit.c is not None and fit.c != 0) else None
+            data = company_data.et_id, company_data.symbol, company_data.company_name, company_data.sector, \
+                   company_data.industry, company_data.mkt_cap_in_cr, feature.name, fit.m, fit.c, mc_ratio
+
+            data_list.append(data)
+
+        self.conn.executemany(self.insert_into_linear_fit_sql, data_list)
         self.conn.commit()
 
     def fetch_et_company_by_name(self, name) -> Optional[CompanyNameAndUrl]:
@@ -645,15 +693,13 @@ def populate_et_company_data(persistence_service: DataPersistenceService):
             break
 
 
-def get_industries_group_by_sector() -> Dict[str, List[str]]:
-    result = defaultdict(set)
-    sql = f"SELECT sector, industry FROM {DataPersistenceService.et_companies_data} ORDER BY sector"
+def get_et_company_data(company_name) -> PageData:
     with DataPersistenceService() as service:
-        data = service.execute(sql)
-        for sector, industry in data:
-            if (sector is not None) and (industry is not None):
-                result[sector].add(industry)
-        return result
+        return service.fetch_et_company_data_by_name(company_name)
+
+
+def get_formatted_str_from_json(json_dict):
+    return json.dumps(json_dict, indent=4, sort_keys=False)
 
 
 def main():
